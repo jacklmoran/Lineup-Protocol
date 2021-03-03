@@ -1,0 +1,238 @@
+---
+title: "Independence Simulation"
+author: "Jack Moran"
+date: "12/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(arm)
+library(ggplot2)
+library(purrr)
+library(nullabor)
+library(broom)
+library(rjags)
+library(coda)
+```
+
+# Simulation
+
+Situation 3: Severe Group Effects
+ngroups <- floor(sqrt(n))
+W <- rnorm(ngroups, 0, 0.8) 
+
+Situation 4: Mild Group Effects
+ngroups <- floor(sqrt(n))
+W <- rnorm(ngroups, 0, 0.4) 
+
+Situation 5: Severe Group Effects, Few Observations Per Group
+ngroups <- floor(sqrt(n)*2)
+W <- rnorm(ngroups, 0, 0.8) 
+
+
+```{r Data Simulation and Lineup Creation}
+set.seed(813028719)
+
+n <- 150
+ngroups <- floor(sqrt(n))
+
+x1 <- rnorm(n, 0, 1)
+group <- sample(1:ngroups, n, replace = TRUE)
+
+B <- c(-1.5, 0.5)                 # fixed
+W <- rnorm(ngroups, 0, 0.8)       # random
+
+xB <- B[1] + B[2]*x1 + W[group]
+
+p <- 1/(1 + exp(-xB))
+y <- rbinom(n, 1, p)
+
+true_data <- data.frame(y, x1, group)
+
+# Binned Residual Setup # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+set.seed(35745571) 
+
+fit1 <- glm(y ~ x1, family = "binomial", true_data)
+fit1_aug <- augment(fit1, type.predict = "response", type.residuals = "pearson")
+
+fit1_aug <- fit1_aug %>% mutate(group = group) %>%
+  group_by(group) %>%
+  summarise(med.x1 = median(x1),
+            mean.x1 = mean(x1),
+            avg.resid = mean(.resid),
+            grp.size = n(),
+            prop.y = mean(y),
+            prop.grp = sum(.fitted)/grp.size) %>%
+  mutate(upper = 2*sqrt(prop.y*(1-prop.y)/(prop.grp*(1-prop.grp)*grp.size)),
+         lower = -upper)
+
+fit1_sim_y <- replicate(19, expr = simulate(fit1), simplify = FALSE)
+fit1_nulls <- lapply(fit1_sim_y, FUN = function(x) {
+  augment(glm(x[[1]] ~ x1, data = true_data, family = binomial), 
+          type.predict = "response", type.residuals = "pearson")
+})
+fit1_nulls <- purrr::map(fit1_nulls, ~mutate(.x, group = group))
+
+fit1_nulls_res <- purrr::map(fit1_nulls, ~group_by(.x, group) %>%
+                           summarise(med.x1 = median(x1),
+                                     mean.x1 = mean(x1),
+                                     avg.resid = mean(.resid),
+                                     grp.size = n(),
+                                     prop.y = mean(x..1..),
+                                     prop.grp = sum(.fitted)/grp.size))
+fit1_nulls_res <- 
+  purrr::map(fit1_nulls_res, ~mutate(.x, 
+                  upper = 2*sqrt(prop.y*(1-prop.y)/(prop.grp*(1-prop.grp)*grp.size)),
+                  lower = -upper))
+
+fit1_nulls_res <- bind_rows(fit1_nulls_res, .id = ".n")
+fit1_nulls_res$.n <- as.numeric(fit1_nulls_res$.n)
+
+# Logit Setup  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+data.empLO <- group_by(true_data, group) %>%
+  summarise(x1.grps.med = median(x1),
+         x1.grps.mean = mean(x1),
+         pi.emp = mean(y),
+         pi.emp = case_when(pi.emp == 0 ~ 0.01,
+                            pi.emp == 1 ~ 0.99,
+                            TRUE        ~mean(y)),
+         log.odds.emp = log(pi.emp/(1-pi.emp))) %>%
+  ungroup()
+
+fit1_nulls_log <- purrr::map(fit1_nulls, ~group_by(.x, group) %>%
+                           summarise(x1.grps.med = median(x1),
+                                  x1.grps.mean = mean(x1),
+                                  pi.emp = mean(x..1..),
+                                  pi.emp = case_when(pi.emp == 0 ~ 0.01,
+                                                     pi.emp == 1 ~ 0.99,
+                                                     TRUE        ~mean(x..1..)),
+                                  log.odds.emp = log(pi.emp/(1-pi.emp))) %>%
+             ungroup())
+
+fit1_nulls_log <- bind_rows(fit1_nulls_log, .id = ".n")
+fit1_nulls_log$.n <- as.numeric(fit1_nulls_log$.n)
+
+# Creating the 3 lineups  # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+lineup(true = fit1_aug, n = 20, samples = fit1_nulls_res) %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = 2, color = "blue") +
+  geom_point(aes(x = med.x1, y = avg.resid), size = 2) +
+  facet_wrap(~ .sample) + 
+  labs(x = "Average Binned Score",
+       y = "Average Binned Residual")
+#ggsave("S5_250_X2_BR.png", path = "./Lineup Graphics", scale = 1.75)
+
+lineup(true = fit1_aug, n = 20, samples = fit1_nulls_res) %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = 2, color = "blue") +
+  geom_point(aes(x = med.x1, y = avg.resid), size = 2) +
+  geom_line(aes(x = med.x1, y = upper), color = "dark grey") +
+  geom_line(aes(x = med.x1, y = lower), color = "dark grey") +
+  facet_wrap(~ .sample) + 
+  labs(x = "Average Binned Score",
+       y = "Average Binned Residual")
+#ggsave("S5_250_X2_BR95.png", path = "./Lineup Graphics", scale = 1.75)
+
+lineup(true = data.empLO, n = 20, samples = fit1_nulls_log) %>%
+  ggplot(aes(x = x1.grps.med, y = log.odds.emp)) +
+  geom_point() +
+  facet_wrap(~ .sample) + 
+  labs(x = "Average Binned Score",
+       y = "Log Odds") 
+#ggsave("S5_150_V1_EL_Freq.png", path = "./Lineup Graphics/Appendix A", scale = 1.75)
+summary(fit1)
+```
+
+```{r Pearson GoF Simulation}
+set.seed(18572452)
+# Classical - Parametric Bootstrap Pearson Goodness of Fit
+nIter <- 5000
+pear.stat <- numeric(nIter)
+pear.obs <- sum(resid(fit1, type = "pearson")^2)
+
+group.stat <- data.frame(rep = c(), )
+for(k in 1:nIter){
+  y.simul <- data.frame(simulate(fit1), x1, group)
+  simul.fit <- glm(sim_1 ~ x1, family = "binomial", y.simul)
+  pear.stat[k] <- sum(resid(simul.fit, type = "pearson")^2)
+  
+  y.simul %>% group_by(group) %>% summarize(propy = mean(y),
+                                            medx1 = median(x1))
+}
+
+pvals <- numeric(ngroups)
+for(i in 1:ngroups){
+  pvals[i] <- as.numeric(PPgroups %>% ungroup() %>%
+  filter(group == i) %>% summarize(pval = mean(propy < OBSgroups$propy[i])))
+}
+
+(pvalue <- mean(pear.stat >= pear.obs))         # pvalue
+```
+
+```{r}
+set.seed(98798855)
+inits <- list(list(".RNG.name" = "base::Wichmann-Hill", ".RNG.seed" = 2887351))
+X <- cbind(intercept = 1, x1 = x1)
+dat_list <- list(Y = y, X = X, 
+                 n = n, p = ncol(X))
+
+model_string <- textConnection("model{
+for(i in 1:n){
+  Y[i] ~ dbern(q[i])
+  logit(q[i]) <- inprod(X[i,],beta[])
+}
+for(j in 1:p){beta[j] ~ dnorm(0,0.001)}
+
+# Posterior Predictive
+for(i in 1:n) {
+  Yp[i]  ~ dbern(q[i])
+}
+}")
+
+logistic_model <- jags.model(model_string, data = dat_list, 
+                             n.chains = 1, quiet = TRUE, inits = inits)
+update(logistic_model, 5000, progress.bar = "none")
+post_samples <- coda.samples(logistic_model, variable.names = c("beta", "Yp"), 
+                             n.iter = 30*n, thin = 30, progress.bar = "none")
+
+# Posterior Predictive Check # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+PPgroups <- data.frame(post_samples[[1]][,1:n], x1 = x1, group = group) %>%
+  pivot_longer(cols = 1:n, names_to = "rep", values_to = "y") %>%
+  mutate(rep = as.numeric(str_sub(rep, 4, -2))) %>%
+  group_by(rep) %>% group_by(group, .add = TRUE) %>%
+  summarize(propy = mean(y),
+            medx1 = median(x1))
+OBSgroups <- true_data %>% 
+  group_by(group) %>%
+  summarize(propy = mean(y),
+           medx1 = median(x1))
+
+pvals <- numeric(ngroups)
+for(i in 1:ngroups){
+  pvals[i] <- as.numeric(PPgroups %>% ungroup() %>%
+  filter(group == i) %>% summarize(pval = mean(propy < OBSgroups$propy[i])))
+}
+sig <- which(pvals < 0.025 | pvals > 0.975)
+
+ggplot(PPgroups) + 
+  geom_histogram(aes(x = propy), bins = 10) +
+  geom_vline(data = OBSgroups, aes(xintercept = propy), color = "orange", size = 1.2) + 
+  facet_wrap(~group, nrow = 2) + 
+  geom_rect(data = subset(PPgroups, group %in% sig), 
+                          fill = NA, colour = "blue", 
+                          xmin = -Inf,xmax = Inf,
+                          ymin = -Inf,ymax = Inf) + 
+  labs(x = TeX("Proportion Success by Group"),
+       y = "Count")
+# ggsave("PPgroups.png", path = "./Lineup Graphics/Presentation Visuals/", 
+#        units = "in", height = 3.5, scale = 2, plot = PPgroups1)
+
+knitr::kable(x = (data.frame(Group = 1:ngroups, Pvalue = pvals)), digits = 2)
+```
+

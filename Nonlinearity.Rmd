@@ -1,0 +1,247 @@
+---
+title: "Nonlinearity Simulation"
+author: "Jack Moran"
+date: "12/20/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(arm)
+library(ggplot2)
+library(purrr)
+library(nullabor)
+library(broom)
+library(rjags)
+library(coda)
+library(latex2exp)
+
+```
+
+# Simulation
+
+Situation 0: No Violation
+B <- c(-1.5, 0.5, 0)
+
+Situation 1: Severe Non-linearity
+B <- c(-1.5, 0.5, 0.4)
+
+Situation 2: Slight Non-linearity
+B <- c(-1.5, 0.5, 0.2)
+
+```{r Data Simulation and Lineup Creation}
+set.seed(703531619) # real data seed
+n <- 250
+
+x1 <- rnorm(n, 0, 1)
+B <- c(-1.5, 0.5, 0.4)
+
+xB <- B[1] + B[2]*x1 + B[3]*(x1^2)
+
+p <- 1/(1 + exp(-xB))
+hist(p)
+y <- rbinom(n, 1, p)
+
+true_data <- data.frame(y, x1)
+
+# Binned Residual Setup # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+set.seed(331765113) # null data seed
+
+fit1 <- glm(y ~ x1, family = "binomial", true_data)
+#summary(fit1)
+fit1_aug <- augment(fit1, type.predict = "response", type.residuals = "pearson")
+
+fit1_aug <- fit1_aug %>% mutate(x1.grps = ntile(x1, n = floor(sqrt(n)))) %>%
+  group_by(x1.grps) %>%
+  summarise(med.x1 = median(x1),
+            mean.x1 = mean(x1),
+            avg.resid = mean(.resid),
+            grp.size = n(),
+            prop.y = mean(y),
+            prop.grp = sum(.fitted)/grp.size) %>%
+  mutate(upper = 2*sqrt(prop.y*(1-prop.y)/(prop.grp*(1-prop.grp)*grp.size)),
+         lower = -upper)
+
+fit1_sim_y <- replicate(19, expr = simulate(fit1), simplify = FALSE)
+fit1_nulls <- lapply(fit1_sim_y, FUN = function(x) {
+  augment(glm(x[[1]] ~ x1, data = true_data, family = binomial), 
+          type.predict = "response", type.residuals = "pearson")
+})
+fit1_nulls <- purrr::map(fit1_nulls, 
+                         ~mutate(.x, x1.grps = ntile(x1, n = floor(sqrt(n)))))
+
+fit1_nulls_res <- purrr::map(fit1_nulls, ~group_by(.x, x1.grps) %>%
+                           summarise(med.x1 = median(x1),
+                                     mean.x1 = mean(x1),
+                                     avg.resid = mean(.resid),
+                                     grp.size = n(),
+                                     prop.y = mean(x..1..),
+                                     prop.grp = sum(.fitted)/grp.size))
+fit1_nulls_res <- 
+  purrr::map(fit1_nulls_res, ~mutate(.x, 
+                  upper = 2*sqrt(prop.y*(1-prop.y)/(prop.grp*(1-prop.grp)*grp.size)),
+                  lower = -upper))
+
+fit1_nulls_res <- bind_rows(fit1_nulls_res, .id = ".n")
+fit1_nulls_res$.n <- as.numeric(fit1_nulls_res$.n)
+
+# Logit Setup  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+true_data <- mutate(true_data, x1.grps = ntile(x1, n = floor(sqrt(n))))
+data.empLO <- group_by(true_data, x1.grps) %>%
+  summarise(x1.grps.med = median(x1),
+         pi.emp = mean(y),
+         pi.emp = case_when(pi.emp == 0 ~ 0.01,
+                            pi.emp == 1 ~ 0.99,
+                            TRUE        ~mean(y)),
+         log.odds.emp = log(pi.emp/(1-pi.emp))) %>%
+  ungroup()
+
+fit1_nulls_log <- purrr::map(fit1_nulls, ~group_by(.x, x1.grps) %>%
+                           summarise(x1.grps.med = median(x1),
+                                  pi.emp = mean(x..1..),
+                                  pi.emp = case_when(pi.emp == 0 ~ 0.01,
+                                                     pi.emp == 1 ~ 0.99,
+                                                     TRUE        ~mean(x..1..)),
+                                  log.odds.emp = log(pi.emp/(1-pi.emp))) %>%
+             ungroup())
+
+fit1_nulls_log <- bind_rows(fit1_nulls_log, .id = ".n")
+fit1_nulls_log$.n <- as.numeric(fit1_nulls_log$.n)
+
+# Creating the 3 lineups  # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# Simple Binned Residual
+lineup(true = fit1_aug, n = 20, samples = fit1_nulls_res) %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = 2, color = "blue") +
+  geom_point(aes(x = med.x1, y = avg.resid), size = 2) +
+  facet_wrap(~ .sample) +
+  labs(x = "Average Binned Score",
+       y = "Average Binned Residual")
+# ggsave("S2_120_L2_BR_Freq.png", path = "./Lineup Graphics/Appendix A", scale = 1.75)
+
+# Binned Residual with bounds
+lineup(true = fit1_aug, n = 20, samples = fit1_nulls_res) %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = 2, color = "blue") +
+  geom_point(aes(x = med.x1, y = avg.resid), size = 2) +
+  geom_line(aes(x = mean.x1, y = upper), color = "dark grey") +
+  geom_line(aes(x = mean.x1, y = lower), color = "dark grey") +
+  facet_wrap(~ .sample) +
+  labs(x = "Average Binned Score",
+       y = "Average Binned Residual")
+#ggsave("S1_250_G2_BR95_Freq.png", path = "./Lineup Graphics/Appendix A", scale = 1.75)
+
+# Empirical Logits
+lineup(true = data.empLO, n = 20, samples = fit1_nulls_log) %>%
+  ggplot(aes(x = x1.grps.med, y = log.odds.emp)) +
+  geom_point() +
+  facet_wrap(~ .sample) + 
+  labs(x = "Average Binned Score",
+       y = "Log Odds") 
+#ggsave("S1_250_G2_EL_Freq.png", path = "./Lineup Graphics/Appendix A", scale = 1.75)
+summary(fit1)
+```
+
+```{r Pearson GoF Simulation}
+set.seed(98798855)
+# Classical - Parametric Bootstrap Pearson Goodness of Fit
+nIter <- 5000
+pear.stat <- numeric(nIter)
+pear.obs <- sum(resid(fit1, type = "pearson")^2)
+for(k in 1:nIter){
+  y.simul <- data.frame(simulate(fit1), x1)
+  simul.fit <- glm(sim_1 ~ x1, family = "binomial", y.simul)
+  pear.stat[k] <- sum(resid(simul.fit, type = "pearson")^2)
+}
+(pvalue <- mean(pear.stat >= pear.obs))         # GoF pvalue
+
+ggplot() + 
+  geom_histogram(aes(x = pear.stat), bins = 22) +
+  geom_vline(aes(xintercept = pear.obs), color = "orange") +
+  labs(x = "Pearson Statistic",
+       y = "Count")
+#ggsave("PGoF.png", path = "./Lineup Graphics/Presentation Visuals/", 
+#       scale = 1)
+```
+
+```{r Posterior Predictive Simulation}
+set.seed(42624322)
+inits <- list(list(".RNG.name" = "base::Wichmann-Hill", ".RNG.seed" = 894035))
+X <- cbind(intercept = 1, x1 = x1)
+dat_list <- list(Y = y, X = X, 
+                 n = n, p = ncol(X))
+
+model_string <- textConnection("model{
+for(i in 1:n){
+  Y[i] ~ dbern(q[i])
+  logit(q[i]) <- inprod(X[i,],beta[])
+}
+for(j in 1:p){beta[j] ~ dnorm(0,0.001)}
+
+# Posterior Predictive
+for(i in 1:n) {
+  Yp[i]  ~ dbern(q[i])
+}
+}")
+
+logistic_model <- jags.model(model_string, data = dat_list, 
+                             n.chains = 1, quiet = TRUE, inits = inits)
+update(logistic_model, 5000, progress.bar = "none")
+post_samples <- coda.samples(logistic_model, variable.names = c("beta", "Yp"), 
+                             n.iter = 30*n, thin = 30, progress.bar = "none")
+
+# Smoother Figure  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+index <- sample(1:n, 30)
+data.frame(post_samples[[1]][,1:n], x1 = x1)  %>%
+  pivot_longer(cols = 1:n, names_to = "rep") %>%
+  mutate(rep = as.numeric(str_sub(rep, 4, -2))) %>%
+  filter(rep %in% index) %>%
+ggplot(aes(x = x1, y = value, color = as.factor(rep))) + 
+  geom_point(alpha = 0.05) + 
+  geom_smooth(se = FALSE, span = 3) + 
+  geom_point(inherit.aes = FALSE, data = true_data, aes(x = x1, y = y), alpha = 0.5) + 
+  geom_smooth(inherit.aes = FALSE, data = true_data, aes(x = x1, y = y), color = "black",size = 1.5, se = FALSE, span = 3) +
+  theme(legend.position = "none") +
+  ylim(0,1) +
+  labs(y = TeX("$y$"), x = TeX("$x_1$"))
+  
+# ggsave("PPvisual.png", path = "./Lineup Graphics",
+#       units = "in", scale = 1.75)
+
+
+# Binned Data Figure  # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+nulldist <- true_data %>% group_by(x1.grps) %>%
+  summarize(yprob = mean(y),
+            xmed = median(x1),
+            rep = 0)
+index2 <- sample(1:n, 5)
+data.frame(post_samples[[1]][,1:n], x1 = x1, x1.grps = true_data$x1.grps)  %>%
+  pivot_longer(cols = 1:n, names_to = "rep") %>%
+  mutate(rep = as.numeric(str_sub(rep, 4, -2))) %>%
+  group_by(rep) %>% group_by(x1.grps, .add = TRUE) %>%
+  summarize(yprob = mean(value),
+            xmed = median(x1)) %>%
+  rbind(nulldist, .) %>%
+  filter(rep %in% c(0, index2)) %>%
+ggplot(aes(x = xmed, y = yprob)) + 
+  geom_point() +
+  facet_wrap(~rep, nrow = 2) + 
+  theme(legend.position = "none") +
+  ylim(0,1) +
+  labs(y = TeX("Average $y$"), x = TeX("Median $x_1$"))
+
+# ggsave("PPbinnedDist.png", path = "./Lineup Graphics/Presentation Visuals/",
+#       units = "in", scale = 1.5)
+```
+
+
+
+
